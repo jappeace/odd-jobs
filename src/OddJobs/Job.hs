@@ -169,8 +169,7 @@ logCallbackErrors jid msg action = catchAny action $ \e -> log LevelError $ LogT
 
 instance HasJobRunner RunnerM where
   getPollingInterval = cfgPollingInterval . envConfig <$> ask
-  onJobFailed = cfgOnJobFailed . envConfig  <$> ask
-
+  onJobFailed = do { env <- ask; pure (cfgOnJobFailed (envConfig env)) }
   onJobSuccess job = do
     fn <- cfgOnJobSuccess . envConfig <$> ask
     logCallbackErrors (jobId job) "onJobSuccess" $ liftIO $ fn job
@@ -303,7 +302,7 @@ saveJob j = do
 saveJobIO :: Connection -> TableName -> Job -> IO Job
 saveJobIO conn tname Job{jobRunAt, jobStatus, jobPayload, jobLastError, jobAttempts, jobLockedBy, jobLockedAt, jobId} = do
   rs <- PGS.query conn saveJobQuery
-        ( tname 
+        ( tname
         , jobRunAt
         , jobStatus
         , jobPayload
@@ -657,7 +656,7 @@ scheduleJob conn tname payload runAt = do
   case rs of
     [] -> (Prelude.error . (<> "Not expecting a blank result set when creating a job. Query=")) <$> queryFormatter
     [r] -> pure r
-    _ -> (Prelude.error . (<> "Not expecting multiple rows when creating a single job. Query=")) <$> queryFormatter 
+    _ -> (Prelude.error . (<> "Not expecting multiple rows when creating a single job. Query=")) <$> queryFormatter
 
 
 -- getRunnerEnv :: (HasJobRunner m) => m RunnerEnv
@@ -713,4 +712,3 @@ fetchAllJobRunners :: (MonadIO m)
                    -> m [JobRunnerName]
 fetchAllJobRunners UIConfig{uicfgTableName, uicfgDbPool} = liftIO $ withResource uicfgDbPool $ \conn -> do
   fmap (mapMaybe fromOnly) $ PGS.query conn "select distinct locked_by from ?" (Only uicfgTableName)
-
