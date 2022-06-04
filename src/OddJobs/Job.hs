@@ -260,7 +260,7 @@ withDbConnection :: (HasJobRunner m)
                  -> m a
 withDbConnection action = do
   pool <- getDbPool
-  withResource pool action
+  withRunInIO $ \runInIO -> withResource pool $ runInIO . action
 
 --
 -- $dbHelpers
@@ -528,26 +528,26 @@ jobPoller = do
   traceM "jobPoller just before log statement"
   log LevelInfo $ LogText $ toS $ "Starting the job monitor via DB polling with processName=" <> processName
   concurrencyControlFn <- getConcurrencyControlFn
-  withResource pool $ \pollerDbConn -> forever $ concurrencyControlFn >>= \case
-    False -> do
+  withRunInIO $ \runInIO -> withResource pool $ \pollerDbConn -> forever $ runInIO concurrencyControlFn >>= \case
+    False -> runInIO $ do
       log LevelWarn $ LogText $ "NOT polling the job queue due to concurrency control"
       -- If we can't run any jobs ATM, relax and wait for resources to free up
       delayAction
     True -> do
       nextAction <- mask_ $ do
-        log LevelDebug $ LogText $ toS $ "[" <> processName <> "] Polling the job queue.."
-        r <- liftIO $ jobPollingIO pollerDbConn processName tname lockTimeout
+        runInIO $ log LevelDebug $ LogText $ toS $ "[" <> processName <> "] Polling the job queue.."
+        r <- jobPollingIO pollerDbConn processName tname lockTimeout
         case r of
           -- When we don't have any jobs to run, we can relax a bit...
           [] -> pure delayAction
 
           -- When we find a job to run, fork and try to find the next job without any delay...
           [Only (jid :: JobId)] -> do
-            void $ async $ runJob jid
+            void $ async $ runInIO $ runJob jid
             pure noDelayAction
 
           x -> error $ "WTF just happened? I was supposed to get only a single row, but got: " ++ (show x)
-      nextAction
+      runInIO nextAction
   where
     delayAction = delaySeconds =<< getPollingInterval
     noDelayAction = pure ()
@@ -572,34 +572,34 @@ jobEventListener = do
           [Only (_ :: JobId)] -> pure $ Just jid
           x -> error $ "WTF just happned? Was expecting a single row to be returned, received " ++ (show x)
 
-  withResource pool $ \monitorDbConn -> do
-    void $ liftIO $ PGS.execute monitorDbConn ("LISTEN ?") (Only $ pgEventName tname)
+  withRunInIO $ \runInIO -> withResource pool $ \monitorDbConn -> do
+    void $ PGS.execute monitorDbConn ("LISTEN ?") (Only $ pgEventName tname)
     forever $ do
-      log LevelDebug $ LogText "[LISTEN/NOTIFY] Event loop"
-      notif <- liftIO $ getNotification monitorDbConn
-      concurrencyControlFn >>= \case
-        False -> log LevelWarn $ LogText "Received job event, but ignoring it due to concurrency control"
+      runInIO $ log LevelDebug $ LogText "[LISTEN/NOTIFY] Event loop"
+      notif <- getNotification monitorDbConn
+      runInIO concurrencyControlFn >>= \case
+        False -> runInIO $ log LevelWarn $ LogText "Received job event, but ignoring it due to concurrency control"
         True -> do
           let pload = notificationData notif
-          log LevelDebug $ LogText $ toS $ "NOTIFY | " <> show pload
+          runInIO $ log LevelDebug $ LogText $ toS $ "NOTIFY | " <> show pload
           case (eitherDecode $ toS pload) of
-            Left e -> log LevelError $ LogText $ toS $  "Unable to decode notification payload received from Postgres. Payload=" <> show pload <> " Error=" <> show e
+            Left e -> runInIO $ log LevelError $ LogText $ toS $  "Unable to decode notification payload received from Postgres. Payload=" <> show pload <> " Error=" <> show e
 
             -- Checking if job needs to be fired immediately AND it is not already
             -- taken by some othe thread, by the time it got to us
             Right (v :: Value) -> case (Aeson.parseMaybe parser v) of
-              Nothing -> log LevelError $ LogText $ toS $ "Unable to extract id/run_at/locked_at from " <> show pload
+              Nothing -> runInIO $ log LevelError $ LogText $ toS $ "Unable to extract id/run_at/locked_at from " <> show pload
               Just (jid, runAt_, mLockedAt_) -> do
-                t <- liftIO getCurrentTime
+                t <- getCurrentTime
                 if (runAt_ <= t) && (isNothing mLockedAt_)
-                  then do log LevelDebug $ LogText $ toS $ "Job needs needs to be run immediately. Attempting to fork in background. JobId=" <> show jid
+                  then do runInIO $ log LevelDebug $ LogText $ toS $ "Job needs needs to be run immediately. Attempting to fork in background. JobId=" <> show jid
                           void $ async $ do
                             -- Let's try to lock the job first... it is possible that it has already
                             -- been picked up by the poller by the time we get here.
-                            tryLockingJob jid >>= \case
+                            runInIO $ tryLockingJob jid >>= \case
                               Nothing -> pure ()
                               Just lockedJid -> runJob lockedJid
-                  else log LevelDebug $ LogText $ toS $ "Job is either for future, or is already locked. Skipping. JobId=" <> show jid
+                  else runInIO $ log LevelDebug $ LogText $ toS $ "Job is either for future, or is already locked. Skipping. JobId=" <> show jid
   where
     parser :: Value -> Aeson.Parser (JobId, UTCTime, Maybe UTCTime)
     parser = withObject "expecting an object to parse job.run_at and job.locked_at" $ \o -> do
